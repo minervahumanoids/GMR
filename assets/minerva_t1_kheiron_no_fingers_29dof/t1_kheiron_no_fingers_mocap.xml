@@ -141,7 +141,8 @@
                                         <geom type="mesh" contype="0" conaffinity="0" group="1" rgba="0.4 0.4 0.4 1.0" mesh="left_foot_link" />
                                         <geom name="left_foot_collision" size="0.1115 0.05 0.015" pos="0.01 0 -0.015" type="box" rgba="0.4 0.4 0.4 0.0" />
                                         <site name="left_foot" pos="0.05 0 -0.025" size="0.01" rgba="0.2 0.8 0.2 0.8" />
-                                        <body name="left_foot_contact_point" pos="0 0 -0.032" />
+                                        <body name="left_foot_contact_point" pos="0.05 0 -0.025" />
+                                        <body name="left_heel_contact_point" pos="-0.05 0 -0.025" />
                                     </body>
                                 </body>
                             </body>
@@ -177,7 +178,8 @@
                                         <geom type="mesh" contype="0" conaffinity="0" group="1" rgba="0.4 0.4 0.4 1.0" mesh="right_foot_link" />
                                         <geom name="right_foot_collision" size="0.1115 0.05 0.015" pos="0.01 0 -0.015" type="box" rgba="0.4 0.4 0.4 0.0" />
                                         <site name="right_foot" pos="0.05 0 -0.025" size="0.01" rgba="0.2 0.8 0.2 0.8" />
-                                        <body name="right_foot_contact_point" pos="0 0 -0.032" />
+                                        <body name="right_foot_contact_point" pos="0.05 0 -0.025" />
+                                        <body name="right_heel_contact_point" pos="-0.05 0 -0.025" />
                                     </body>
                                 </body>
                             </body>

@@ -53,7 +53,67 @@ def resolve_torch_device(requested_device: str) -> str:
     return requested_device
 
 
-def process_file(smplx_file_path, tgt_file_path, tgt_robot, SMPLX_FOLDER, tgt_folder, fk_device, use_collision_avoidance, total_files, verbose=False):
+def compute_scaled_human_lowest_z(smplx_frame_data_list, retargeter):
+    human_lowest_z = []
+    for frame_data in smplx_frame_data_list:
+        human_frame = {
+            body_name: [np.asarray(pos), np.asarray(quat)]
+            for body_name, (pos, quat) in frame_data.items()
+        }
+        scaled_human = retargeter.scale_human_data(
+            human_frame, retargeter.human_root_name, retargeter.human_scale_table
+        )
+        lowest_z = min(pos[2] for pos, _ in scaled_human.values())
+        human_lowest_z.append(lowest_z)
+    return np.asarray(human_lowest_z, dtype=np.float32)
+
+
+def snap_near_ground_to_zero(target_z, threshold_m=0.03):
+    snapped = np.asarray(target_z, dtype=np.float32).copy()
+    snapped[snapped < threshold_m] = 0.0
+    return snapped
+
+
+def get_grounding_body_indices(kinematics_model):
+    contact_indices = [
+        index for index, body_name in enumerate(kinematics_model.body_names)
+        if body_name.endswith("_contact_point")
+    ]
+    return contact_indices or None
+
+
+def apply_height_adjust(root_pos, root_rot, dof_pos, kinematics_model, device, mode: str, human_lowest_z=None):
+    body_pos, _ = kinematics_model.forward_kinematics(
+        torch.from_numpy(root_pos).to(device=device, dtype=torch.float),
+        torch.from_numpy(root_rot).to(device=device, dtype=torch.float),
+        torch.from_numpy(dof_pos).to(device=device, dtype=torch.float),
+    )
+    grounding_body_indices = get_grounding_body_indices(kinematics_model)
+    grounding_body_pos_z = (
+        body_pos[:, grounding_body_indices, 2]
+        if grounding_body_indices is not None
+        else body_pos[..., 2]
+    )
+    ground_offset = 0.0
+    if mode == "clip":
+        lowest_height = torch.min(grounding_body_pos_z).item()
+        root_pos[:, 2] = root_pos[:, 2] - lowest_height + ground_offset
+        return
+    if mode == "frame":
+        lowest_heights = torch.min(grounding_body_pos_z, dim=1).values.detach().cpu().numpy()
+        root_pos[:, 2] = root_pos[:, 2] - lowest_heights + ground_offset
+        return
+    if mode == "human_frame":
+        if human_lowest_z is None:
+            raise ValueError("human_lowest_z is required for height_adjust_mode='human_frame'")
+        lowest_heights = torch.min(grounding_body_pos_z, dim=1).values.detach().cpu().numpy()
+        target_floor_z = snap_near_ground_to_zero(human_lowest_z)
+        root_pos[:, 2] = root_pos[:, 2] - lowest_heights + target_floor_z
+        return
+    raise ValueError(f"Unknown height_adjust_mode: {mode}")
+
+
+def process_file(smplx_file_path, tgt_file_path, tgt_robot, SMPLX_FOLDER, tgt_folder, fk_device, use_collision_avoidance, height_adjust_mode, total_files, verbose=False):
     def log_memory(message):
         if verbose:
             process = psutil.Process(os.getpid())
@@ -99,6 +159,9 @@ def process_file(smplx_file_path, tgt_file_path, tgt_robot, SMPLX_FOLDER, tgt_fo
         actual_human_height=actual_human_height,
         use_collision_avoidance=use_collision_avoidance,
     )
+    human_lowest_z = None
+    if height_adjust_mode == "human_frame":
+        human_lowest_z = compute_scaled_human_lowest_z(smplx_frame_data_list, retargeter)
     qpos_list = []
     for smplx_frame_data in smplx_frame_data_list:
         qpos = retargeter.retarget(smplx_frame_data)
@@ -135,13 +198,15 @@ def process_file(smplx_file_path, tgt_file_path, tgt_robot, SMPLX_FOLDER, tgt_fo
     
     HEIGHT_ADJUST = True
     if HEIGHT_ADJUST:
-        # height adjust to ensure the lowerset part is on the ground
-        body_pos, _ = kinematics_model.forward_kinematics(torch.from_numpy(root_pos).to(device=device, dtype=torch.float), 
-                                                        torch.from_numpy(root_rot).to(device=device, dtype=torch.float), 
-                                                        torch.from_numpy(dof_pos).to(device=device, dtype=torch.float)) # TxNx3
-        ground_offset = 0.0
-        lowerst_height = torch.min(body_pos[..., 2]).item()
-        root_pos[:, 2] = root_pos[:, 2] - lowerst_height + ground_offset # make sure motion on the ground
+        apply_height_adjust(
+            root_pos,
+            root_rot,
+            dof_pos,
+            kinematics_model,
+            device,
+            height_adjust_mode,
+            human_lowest_z=human_lowest_z,
+        )
         
     ROOT_ORIGIN_OFFSET = True
     if ROOT_ORIGIN_OFFSET:
@@ -205,6 +270,12 @@ def main():
         action="store_true",
         help="Enable collision-aware IK using robot-specific collision_avoidance config, e.g. T1 foot-foot avoidance.",
     )
+    parser.add_argument(
+        "--height-adjust-mode",
+        choices=["clip", "frame", "human_frame"],
+        default="clip",
+        help="Ground-normalize using a single whole-clip shift, independent per-frame shifts, or the scaled human lowest-point trajectory.",
+    )
     args = parser.parse_args()
     
     # print the total number of cpus and gpus
@@ -252,6 +323,7 @@ def main():
                         tgt_folder,
                         fk_device,
                         args.enable_foot_collision_avoidance,
+                        args.height_adjust_mode,
                     ))
     print("full args_list:", len(args_list))
     
