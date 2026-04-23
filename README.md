@@ -231,6 +231,49 @@ Each frame of **robot motion data** can be understood as a tuple of (robot_base_
 
 ## Usage
 
+### Custom Minerva T1 Batch Retargeting
+
+For `minerva_t1_kheiron_no_fingers_29dof`, the current recommended settings are:
+- IK target on the toe-side `foot_contact_point`
+- grounding on all `*_contact_point` bodies, which for the custom T1 means toe + heel
+- `--height-adjust-mode human_frame` so flat-ground clips stay grounded without flattening jumps and stairs
+
+The dataset batch script still keeps its built-in exclusion filter for hard motions plus filenames containing `crawl`, `_lie`, `upstairs`, and `downstairs` in [scripts/smplx_to_robot_dataset.py](scripts/smplx_to_robot_dataset.py).
+
+Retarget OMOMO:
+
+```bash
+source /home/mrahme/miniconda3/etc/profile.d/conda.sh
+conda activate gmr
+cd /home/mrahme/Minerva/GMR
+
+python scripts/smplx_to_robot_dataset.py \
+  --robot minerva_t1_kheiron_no_fingers_29dof \
+  --src_folder /home/mrahme/Minerva/data/raw/public/omomo/smplx \
+  --tgt_folder /home/mrahme/Minerva/data/retargeted/gmr/minerva_t1_kheiron_no_fingers_29dof_humanframe_full/omomo \
+  --num_cpus 8 \
+  --device cpu \
+  --height-adjust-mode human_frame
+```
+
+Retarget AMASS:
+
+```bash
+source /home/mrahme/miniconda3/etc/profile.d/conda.sh
+conda activate gmr
+cd /home/mrahme/Minerva/GMR
+
+python scripts/smplx_to_robot_dataset.py \
+  --robot minerva_t1_kheiron_no_fingers_29dof \
+  --src_folder /home/mrahme/Minerva/data/raw/public/amass/extracted \
+  --tgt_folder /home/mrahme/Minerva/data/retargeted/gmr/minerva_t1_kheiron_no_fingers_29dof_humanframe_full/amass \
+  --num_cpus 8 \
+  --device cpu \
+  --height-adjust-mode human_frame
+```
+
+Add `--override` if you want to overwrite an existing retargeted folder.
+
 ### [NEW] PICO Streaming to Robot (TWIST2)
 
 Install PICO SDK:
