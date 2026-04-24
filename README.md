@@ -265,7 +265,7 @@ cd /home/mrahme/Minerva/GMR
 
 python scripts/smplx_to_robot_dataset.py \
   --robot minerva_t1_kheiron_no_fingers_29dof \
-  --src_folder /home/mrahme/Minerva/data/raw/public/amass/extracted \
+  --src_folder /home/mrahme/Minerva/data/raw/public/amass/smplx \
   --tgt_folder /home/mrahme/Minerva/data/retargeted/gmr/minerva_t1_kheiron_no_fingers_29dof_humanframe_full/amass \
   --num_cpus 8 \
   --device cpu \
