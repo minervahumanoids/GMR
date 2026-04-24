@@ -113,6 +113,15 @@ def apply_height_adjust(root_pos, root_rot, dof_pos, kinematics_model, device, m
     raise ValueError(f"Unknown height_adjust_mode: {mode}")
 
 
+def make_result(status, smplx_file_path, tgt_file_path, error=None):
+    return {
+        "status": status,
+        "smplx_file_path": smplx_file_path,
+        "tgt_file_path": tgt_file_path,
+        "error": error,
+    }
+
+
 def process_file(smplx_file_path, tgt_file_path, tgt_robot, SMPLX_FOLDER, tgt_folder, fk_device, use_collision_avoidance, height_adjust_mode, total_files, verbose=False):
     def log_memory(message):
         if verbose:
@@ -133,24 +142,27 @@ def process_file(smplx_file_path, tgt_file_path, tgt_robot, SMPLX_FOLDER, tgt_fo
         time.sleep(60*2)
         num_pause += 1
         if num_pause > 10:
-            print(f"[ERROR] Memory usage is still high after 10 pauses. Exiting.")
-            return
+            error = "Memory usage is still high after 10 pauses."
+            print(f"[ERROR] {smplx_file_path}: {error}")
+            return make_result("failed", smplx_file_path, tgt_file_path, error)
 
     try:
         smplx_data, body_model, smplx_output, actual_human_height = load_smplx_file(smplx_file_path, SMPLX_FOLDER)
         mocap_frame_rate = smplx_data["mocap_frame_rate"]
         log_memory("After loading SMPL-X data")
     except Exception as e:
-        print(f"Error loading {smplx_file_path}: {e}")
-        return
+        error = f"Error loading {smplx_file_path}: {e}"
+        print(error)
+        return make_result("failed", smplx_file_path, tgt_file_path, str(e))
     
   
     tgt_fps = 30
     try:
         smplx_frame_data_list, aligned_fps = get_smplx_data_offline_fast(smplx_data, body_model, smplx_output, tgt_fps=tgt_fps)
     except Exception as e:
-        print(f"Error processing {smplx_file_path}: {e}")
-        return
+        error = f"Error processing {smplx_file_path}: {e}"
+        print(error)
+        return make_result("failed", smplx_file_path, tgt_file_path, str(e))
     
     # retarget
     retargeter = GMR(
@@ -177,8 +189,9 @@ def process_file(smplx_file_path, tgt_file_path, tgt_robot, SMPLX_FOLDER, tgt_fo
     try:
         root_pos = qpos_list[:, :3]
     except Exception as e:
-        print(f"Error processing {smplx_file_path}: {e}")
-        return
+        error = f"Error processing {smplx_file_path}: {e}"
+        print(error)
+        return make_result("failed", smplx_file_path, tgt_file_path, str(e))
     root_rot = qpos_list[:, 3:7]
     root_rot[:, [0, 1, 2, 3]] = root_rot[:, [1, 2, 3, 0]]
     dof_pos = qpos_list[:, 7:]
@@ -228,12 +241,6 @@ def process_file(smplx_file_path, tgt_file_path, tgt_robot, SMPLX_FOLDER, tgt_fo
     with open(tgt_file_path, "wb") as f:
         pickle.dump(motion_data, f)
         
-    # Progress print based on tgt_folder
-    done = 0
-    for root, _, files in os.walk(tgt_folder):
-        done += len([f for f in files if f.endswith('.pkl')])
-    print(f"Processed {done}/{total_files}: {tgt_file_path}")
-    
     if verbose:
         # Get memory snapshot
         snapshot = tracemalloc.take_snapshot()
@@ -249,6 +256,22 @@ def process_file(smplx_file_path, tgt_file_path, tgt_robot, SMPLX_FOLDER, tgt_fo
     if str(device).startswith("cuda") and torch.cuda.is_available():
         torch.cuda.empty_cache()
     gc.collect()
+
+    return make_result("succeeded", smplx_file_path, tgt_file_path)
+
+
+def process_file_star(args):
+    return process_file(*args)
+
+
+def write_failure_log(tgt_folder, failed_results):
+    if not failed_results:
+        return None
+    failure_log_path = os.path.join(tgt_folder, "_retarget_failures.txt")
+    with open(failure_log_path, "w") as f:
+        for result in failed_results:
+            f.write(f"{result['smplx_file_path']}\t{result['error']}\n")
+    return failure_log_path
     
 
 
@@ -346,15 +369,35 @@ def main():
     total_files = len(args_list)
     print(f"Total number of files to process: {total_files}")
     work_items = [args + (total_files, verbose) for args in args_list]
+    succeeded = 0
+    failed = 0
+    failed_results = []
+
+    def handle_result(index, result):
+        nonlocal succeeded, failed
+        if result["status"] == "succeeded":
+            succeeded += 1
+            print(f"[OK] {index}/{total_files}: {result['tgt_file_path']}")
+            return
+        failed += 1
+        failed_results.append(result)
+        print(f"[FAIL] {index}/{total_files}: {result['smplx_file_path']} -> {result['error']}")
+
     if args.num_cpus <= 1:
-        for work_item in work_items:
-            process_file(*work_item)
+        for index, work_item in enumerate(work_items, start=1):
+            result = process_file(*work_item)
+            handle_result(index, result)
     else:
         pool_context = mp.get_context("spawn") if fk_device.startswith("cuda") else mp
         with pool_context.Pool(args.num_cpus) as pool:
-            pool.starmap(process_file, work_items)
+            for index, result in enumerate(pool.imap_unordered(process_file_star, work_items), start=1):
+                handle_result(index, result)
 
-    print("Done. Saved to ", tgt_folder)
+    failure_log_path = write_failure_log(tgt_folder, failed_results)
+    print(f"Done. Saved to {tgt_folder}")
+    print(f"Summary: attempted={total_files}, succeeded={succeeded}, failed={failed}")
+    if failure_log_path is not None:
+        print(f"Failure log: {failure_log_path}")
 
 
 if __name__ == "__main__":
