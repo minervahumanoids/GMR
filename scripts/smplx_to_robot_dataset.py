@@ -3,6 +3,7 @@ import json
 import pathlib
 import os
 import multiprocessing as mp
+import re
 
 import mujoco as mj
 import numpy as np
@@ -35,8 +36,109 @@ def check_memory(threshold_gb=30):  # adjust based on your available memory
 
 HERE = pathlib.Path(__file__).parent
 
+SIT_FAMILY_PATH_PATTERNS = (
+    re.compile(r"(^|[/_-])(sit|sitdown|sitting|siting|sittingdown|sittingfloor)([/_-]|\d|$)", re.IGNORECASE),
+)
 
-def process_file(smplx_file_path, tgt_file_path, tgt_robot, SMPLX_FOLDER, tgt_folder, total_files, verbose=False):
+
+def resolve_torch_device(requested_device: str) -> str:
+    if requested_device == "auto":
+        if torch.cuda.is_available():
+            try:
+                torch.zeros(1, device="cuda:0")
+                return "cuda:0"
+            except Exception as exc:
+                print(f"[WARNING] CUDA probe failed, falling back to CPU: {exc}")
+        return "cpu"
+    if requested_device.startswith("cuda"):
+        try:
+            torch.zeros(1, device=requested_device)
+        except Exception as exc:
+            raise RuntimeError(f"Requested CUDA device '{requested_device}' is not usable: {exc}") from exc
+    return requested_device
+
+
+def should_exclude_motion_path(motion_path: str, hard_motions, exclude_file_content) -> bool:
+    motion_name = os.path.basename(os.path.splitext(motion_path)[0])
+    if motion_name in hard_motions:
+        return True
+    if any(content in motion_name for content in exclude_file_content):
+        return True
+
+    normalized_path = os.path.splitext(motion_path)[0].replace(os.sep, "/").replace(" ", "_")
+    return any(pattern.search(normalized_path) for pattern in SIT_FAMILY_PATH_PATTERNS)
+
+
+def compute_scaled_human_lowest_z(smplx_frame_data_list, retargeter):
+    human_lowest_z = []
+    for frame_data in smplx_frame_data_list:
+        human_frame = {
+            body_name: [np.asarray(pos), np.asarray(quat)]
+            for body_name, (pos, quat) in frame_data.items()
+        }
+        scaled_human = retargeter.scale_human_data(
+            human_frame, retargeter.human_root_name, retargeter.human_scale_table
+        )
+        lowest_z = min(pos[2] for pos, _ in scaled_human.values())
+        human_lowest_z.append(lowest_z)
+    return np.asarray(human_lowest_z, dtype=np.float32)
+
+
+def snap_near_ground_to_zero(target_z, threshold_m=0.03):
+    snapped = np.asarray(target_z, dtype=np.float32).copy()
+    snapped[snapped < threshold_m] = 0.0
+    return snapped
+
+
+def get_grounding_body_indices(kinematics_model):
+    contact_indices = [
+        index for index, body_name in enumerate(kinematics_model.body_names)
+        if body_name.endswith("_contact_point")
+    ]
+    return contact_indices or None
+
+
+def apply_height_adjust(root_pos, root_rot, dof_pos, kinematics_model, device, mode: str, human_lowest_z=None):
+    body_pos, _ = kinematics_model.forward_kinematics(
+        torch.from_numpy(root_pos).to(device=device, dtype=torch.float),
+        torch.from_numpy(root_rot).to(device=device, dtype=torch.float),
+        torch.from_numpy(dof_pos).to(device=device, dtype=torch.float),
+    )
+    grounding_body_indices = get_grounding_body_indices(kinematics_model)
+    grounding_body_pos_z = (
+        body_pos[:, grounding_body_indices, 2]
+        if grounding_body_indices is not None
+        else body_pos[..., 2]
+    )
+    ground_offset = 0.0
+    if mode == "clip":
+        lowest_height = torch.min(grounding_body_pos_z).item()
+        root_pos[:, 2] = root_pos[:, 2] - lowest_height + ground_offset
+        return
+    if mode == "frame":
+        lowest_heights = torch.min(grounding_body_pos_z, dim=1).values.detach().cpu().numpy()
+        root_pos[:, 2] = root_pos[:, 2] - lowest_heights + ground_offset
+        return
+    if mode == "human_frame":
+        if human_lowest_z is None:
+            raise ValueError("human_lowest_z is required for height_adjust_mode='human_frame'")
+        lowest_heights = torch.min(grounding_body_pos_z, dim=1).values.detach().cpu().numpy()
+        target_floor_z = snap_near_ground_to_zero(human_lowest_z)
+        root_pos[:, 2] = root_pos[:, 2] - lowest_heights + target_floor_z
+        return
+    raise ValueError(f"Unknown height_adjust_mode: {mode}")
+
+
+def make_result(status, smplx_file_path, tgt_file_path, error=None):
+    return {
+        "status": status,
+        "smplx_file_path": smplx_file_path,
+        "tgt_file_path": tgt_file_path,
+        "error": error,
+    }
+
+
+def process_file(smplx_file_path, tgt_file_path, tgt_robot, SMPLX_FOLDER, tgt_folder, fk_device, use_collision_avoidance, height_adjust_mode, total_files, verbose=False):
     def log_memory(message):
         if verbose:
             process = psutil.Process(os.getpid())
@@ -56,31 +158,38 @@ def process_file(smplx_file_path, tgt_file_path, tgt_robot, SMPLX_FOLDER, tgt_fo
         time.sleep(60*2)
         num_pause += 1
         if num_pause > 10:
-            print(f"[ERROR] Memory usage is still high after 10 pauses. Exiting.")
-            return
+            error = "Memory usage is still high after 10 pauses."
+            print(f"[ERROR] {smplx_file_path}: {error}")
+            return make_result("failed", smplx_file_path, tgt_file_path, error)
 
     try:
         smplx_data, body_model, smplx_output, actual_human_height = load_smplx_file(smplx_file_path, SMPLX_FOLDER)
         mocap_frame_rate = smplx_data["mocap_frame_rate"]
         log_memory("After loading SMPL-X data")
     except Exception as e:
-        print(f"Error loading {smplx_file_path}: {e}")
-        return
+        error = f"Error loading {smplx_file_path}: {e}"
+        print(error)
+        return make_result("failed", smplx_file_path, tgt_file_path, str(e))
     
   
     tgt_fps = 30
     try:
         smplx_frame_data_list, aligned_fps = get_smplx_data_offline_fast(smplx_data, body_model, smplx_output, tgt_fps=tgt_fps)
     except Exception as e:
-        print(f"Error processing {smplx_file_path}: {e}")
-        return
+        error = f"Error processing {smplx_file_path}: {e}"
+        print(error)
+        return make_result("failed", smplx_file_path, tgt_file_path, str(e))
     
     # retarget
     retargeter = GMR(
         src_human="smplx",
         tgt_robot=tgt_robot,
         actual_human_height=actual_human_height,
+        use_collision_avoidance=use_collision_avoidance,
     )
+    human_lowest_z = None
+    if height_adjust_mode == "human_frame":
+        human_lowest_z = compute_scaled_human_lowest_z(smplx_frame_data_list, retargeter)
     qpos_list = []
     for smplx_frame_data in smplx_frame_data_list:
         qpos = retargeter.retarget(smplx_frame_data)
@@ -90,14 +199,15 @@ def process_file(smplx_file_path, tgt_file_path, tgt_robot, SMPLX_FOLDER, tgt_fo
 
     log_memory("After retargeting")
     
-    device = "cuda:0"
+    device = fk_device
     kinematics_model = KinematicsModel(retargeter.xml_file, device=device)
 
     try:
         root_pos = qpos_list[:, :3]
     except Exception as e:
-        print(f"Error processing {smplx_file_path}: {e}")
-        return
+        error = f"Error processing {smplx_file_path}: {e}"
+        print(error)
+        return make_result("failed", smplx_file_path, tgt_file_path, str(e))
     root_rot = qpos_list[:, 3:7]
     root_rot[:, [0, 1, 2, 3]] = root_rot[:, [1, 2, 3, 0]]
     dof_pos = qpos_list[:, 7:]
@@ -117,13 +227,15 @@ def process_file(smplx_file_path, tgt_file_path, tgt_robot, SMPLX_FOLDER, tgt_fo
     
     HEIGHT_ADJUST = True
     if HEIGHT_ADJUST:
-        # height adjust to ensure the lowerset part is on the ground
-        body_pos, _ = kinematics_model.forward_kinematics(torch.from_numpy(root_pos).to(device=device, dtype=torch.float), 
-                                                        torch.from_numpy(root_rot).to(device=device, dtype=torch.float), 
-                                                        torch.from_numpy(dof_pos).to(device=device, dtype=torch.float)) # TxNx3
-        ground_offset = 0.0
-        lowerst_height = torch.min(body_pos[..., 2]).item()
-        root_pos[:, 2] = root_pos[:, 2] - lowerst_height + ground_offset # make sure motion on the ground
+        apply_height_adjust(
+            root_pos,
+            root_rot,
+            dof_pos,
+            kinematics_model,
+            device,
+            height_adjust_mode,
+            human_lowest_z=human_lowest_z,
+        )
         
     ROOT_ORIGIN_OFFSET = True
     if ROOT_ORIGIN_OFFSET:
@@ -145,12 +257,6 @@ def process_file(smplx_file_path, tgt_file_path, tgt_robot, SMPLX_FOLDER, tgt_fo
     with open(tgt_file_path, "wb") as f:
         pickle.dump(motion_data, f)
         
-    # Progress print based on tgt_folder
-    done = 0
-    for root, _, files in os.walk(tgt_folder):
-        done += len([f for f in files if f.endswith('.pkl')])
-    print(f"Processed {done}/{total_files}: {tgt_file_path}")
-    
     if verbose:
         # Get memory snapshot
         snapshot = tracemalloc.take_snapshot()
@@ -163,8 +269,25 @@ def process_file(smplx_file_path, tgt_file_path, tgt_robot, SMPLX_FOLDER, tgt_fo
         tracemalloc.stop()
         
     # clean cache
-    torch.cuda.empty_cache()
+    if str(device).startswith("cuda") and torch.cuda.is_available():
+        torch.cuda.empty_cache()
     gc.collect()
+
+    return make_result("succeeded", smplx_file_path, tgt_file_path)
+
+
+def process_file_star(args):
+    return process_file(*args)
+
+
+def write_failure_log(tgt_folder, failed_results):
+    if not failed_results:
+        return None
+    failure_log_path = os.path.join(tgt_folder, "_retarget_failures.txt")
+    with open(failure_log_path, "w") as f:
+        for result in failed_results:
+            f.write(f"{result['smplx_file_path']}\t{result['error']}\n")
+    return failure_log_path
     
 
 
@@ -180,6 +303,18 @@ def main():
     
     parser.add_argument("--override", default=False, action="store_true")
     parser.add_argument("--num_cpus", default=4, type=int)
+    parser.add_argument("--device", default="auto", help="Forward-kinematics device: auto, cpu, cuda:0, ...")
+    parser.add_argument(
+        "--enable-foot-collision-avoidance",
+        action="store_true",
+        help="Enable collision-aware IK using robot-specific collision_avoidance config, e.g. T1 foot-foot avoidance.",
+    )
+    parser.add_argument(
+        "--height-adjust-mode",
+        choices=["clip", "frame", "human_frame"],
+        default="clip",
+        help="Ground-normalize using a single whole-clip shift, independent per-frame shifts, or the scaled human lowest-point trajectory.",
+    )
     args = parser.parse_args()
     
     # print the total number of cpus and gpus
@@ -188,6 +323,8 @@ def main():
     
     src_folder = args.src_folder
     tgt_folder = args.tgt_folder
+    fk_device = resolve_torch_device(args.device)
+    print(f"Using FK device: {fk_device}")
 
     SMPLX_FOLDER = HERE / ".." / "assets" / "body_models"
     hard_motions_folder = HERE / ".." / "assets" / "hard_motions"
@@ -217,18 +354,24 @@ def main():
                 smplx_file_path = os.path.join(dirpath, filename)
                 tgt_file_path = smplx_file_path.replace(src_folder, tgt_folder).replace(".npz", ".pkl")
                 if not os.path.exists(tgt_file_path) or args.override:
-                    args_list.append((smplx_file_path, tgt_file_path, args.robot, SMPLX_FOLDER, tgt_folder))
+                    args_list.append((
+                        smplx_file_path,
+                        tgt_file_path,
+                        args.robot,
+                        SMPLX_FOLDER,
+                        tgt_folder,
+                        fk_device,
+                        args.enable_foot_collision_avoidance,
+                        args.height_adjust_mode,
+                    ))
     print("full args_list:", len(args_list))
     
-    # remove hard and infeasible motions
+    # remove hard, infeasible, and explicitly seated motions by name
     exclude_file_content = ["BMLrub", "EKUT", "crawl", "_lie", "upstairs", "downstairs"]
     
     new_args_list = []
     for arguments in args_list:
-        motion_name = arguments[0].split("/")[-1].split('.')[0]
-        if motion_name in hard_motions:
-            continue
-        if any(content in motion_name for content in exclude_file_content):
+        if should_exclude_motion_path(arguments[0], hard_motions, exclude_file_content):
             continue
         new_args_list.append(arguments)
     args_list = new_args_list
@@ -238,10 +381,36 @@ def main():
     
     total_files = len(args_list)
     print(f"Total number of files to process: {total_files}")
-    with mp.Pool(args.num_cpus) as pool:
-        pool.starmap(process_file, [args + (total_files, verbose) for args in args_list])
+    work_items = [args + (total_files, verbose) for args in args_list]
+    succeeded = 0
+    failed = 0
+    failed_results = []
 
-    print("Done. Saved to ", tgt_folder)
+    def handle_result(index, result):
+        nonlocal succeeded, failed
+        if result["status"] == "succeeded":
+            succeeded += 1
+            print(f"[OK] {index}/{total_files}: {result['tgt_file_path']}")
+            return
+        failed += 1
+        failed_results.append(result)
+        print(f"[FAIL] {index}/{total_files}: {result['smplx_file_path']} -> {result['error']}")
+
+    if args.num_cpus <= 1:
+        for index, work_item in enumerate(work_items, start=1):
+            result = process_file(*work_item)
+            handle_result(index, result)
+    else:
+        pool_context = mp.get_context("spawn") if fk_device.startswith("cuda") else mp
+        with pool_context.Pool(args.num_cpus) as pool:
+            for index, result in enumerate(pool.imap_unordered(process_file_star, work_items), start=1):
+                handle_result(index, result)
+
+    failure_log_path = write_failure_log(tgt_folder, failed_results)
+    print(f"Done. Saved to {tgt_folder}")
+    print(f"Summary: attempted={total_files}, succeeded={succeeded}, failed={failed}")
+    if failure_log_path is not None:
+        print(f"Failure log: {failure_log_path}")
 
 
 if __name__ == "__main__":
