@@ -3,6 +3,7 @@ import json
 import pathlib
 import os
 import multiprocessing as mp
+import re
 
 import mujoco as mj
 import numpy as np
@@ -35,6 +36,10 @@ def check_memory(threshold_gb=30):  # adjust based on your available memory
 
 HERE = pathlib.Path(__file__).parent
 
+SIT_FAMILY_PATH_PATTERNS = (
+    re.compile(r"(^|[/_-])(sit|sitdown|sitting|siting|sittingdown|sittingfloor)([/_-]|\d|$)", re.IGNORECASE),
+)
+
 
 def resolve_torch_device(requested_device: str) -> str:
     if requested_device == "auto":
@@ -51,6 +56,17 @@ def resolve_torch_device(requested_device: str) -> str:
         except Exception as exc:
             raise RuntimeError(f"Requested CUDA device '{requested_device}' is not usable: {exc}") from exc
     return requested_device
+
+
+def should_exclude_motion_path(motion_path: str, hard_motions, exclude_file_content) -> bool:
+    motion_name = os.path.basename(os.path.splitext(motion_path)[0])
+    if motion_name in hard_motions:
+        return True
+    if any(content in motion_name for content in exclude_file_content):
+        return True
+
+    normalized_path = os.path.splitext(motion_path)[0].replace(os.sep, "/").replace(" ", "_")
+    return any(pattern.search(normalized_path) for pattern in SIT_FAMILY_PATH_PATTERNS)
 
 
 def compute_scaled_human_lowest_z(smplx_frame_data_list, retargeter):
@@ -350,15 +366,12 @@ def main():
                     ))
     print("full args_list:", len(args_list))
     
-    # remove hard and infeasible motions
+    # remove hard, infeasible, and explicitly seated motions by name
     exclude_file_content = ["BMLrub", "EKUT", "crawl", "_lie", "upstairs", "downstairs"]
     
     new_args_list = []
     for arguments in args_list:
-        motion_name = arguments[0].split("/")[-1].split('.')[0]
-        if motion_name in hard_motions:
-            continue
-        if any(content in motion_name for content in exclude_file_content):
+        if should_exclude_motion_path(arguments[0], hard_motions, exclude_file_content):
             continue
         new_args_list.append(arguments)
     args_list = new_args_list
