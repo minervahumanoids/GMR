@@ -42,6 +42,8 @@ data/
 data_record/
 Download/
 assets/body_models/
+!assets/body_models/
+!assets/body_models/README.md
 
 # Media files
 *.mp4
@@ -61,6 +63,8 @@ assets/body_models/
 # Model files
 smplx/
 body_models/
+!assets/body_models/
+!assets/body_models/README.md
 *.pkl
 *.pth
 *.pt

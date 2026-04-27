@@ -238,6 +238,12 @@ For `minerva_t1_kheiron_no_fingers_29dof`, the current recommended settings are:
 - grounding on all `*_contact_point` bodies, which for the custom T1 means toe + heel
 - `--height-adjust-mode human_frame` so flat-ground clips stay grounded without flattening jumps and stairs
 
+The custom T1 model uses Inspire hand meshes from the Minerva robot assets
+repository. When GMR is used through `motion_data_processing`, use that repo's
+`external/minerva_robot_assets` submodule as the source of truth for robot
+assets. For standalone GMR checkouts, keep `minerva_robot_assets` as a sibling
+checkout next to `GMR`.
+
 The dataset batch script still keeps its built-in exclusion filter for hard motions plus filenames containing `crawl`, `_lie`, `upstairs`, and `downstairs` in [scripts/smplx_to_robot_dataset.py](scripts/smplx_to_robot_dataset.py).
 
 Retarget OMOMO:
