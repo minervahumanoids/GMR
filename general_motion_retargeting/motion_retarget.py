@@ -3,6 +3,7 @@ import mink
 import mujoco as mj
 import numpy as np
 import json
+from pathlib import Path
 from scipy.spatial.transform import Rotation as R
 from .params import ROBOT_XML_DICT, IK_CONFIG_DICT
 from rich import print
@@ -19,10 +20,12 @@ class GeneralMotionRetargeting:
         damping: float=5e-1, # change from 1e-1 to 1e-2.
         verbose: bool=True,
         use_velocity_limit: bool=False,
+        robot_xml_path: str | None = None,
+        ik_config_path: str | None = None,
     ) -> None:
 
         # load the robot model
-        self.xml_file = str(ROBOT_XML_DICT[tgt_robot])
+        self.xml_file = str(Path(robot_xml_path).expanduser().resolve()) if robot_xml_path else str(ROBOT_XML_DICT[tgt_robot])
         if verbose:
             print("Use robot model: ", self.xml_file)
         self.model = mj.MjModel.from_xml_path(self.xml_file)
@@ -54,10 +57,15 @@ class GeneralMotionRetargeting:
                 print(f"Motor ID {i}: {motor_name}")
 
         # Load the IK config
-        with open(IK_CONFIG_DICT[src_human][tgt_robot]) as f:
+        resolved_ik_config_path = (
+            Path(ik_config_path).expanduser().resolve()
+            if ik_config_path
+            else IK_CONFIG_DICT[src_human][tgt_robot]
+        )
+        with open(resolved_ik_config_path) as f:
             ik_config = json.load(f)
         if verbose:
-            print("Use IK config: ", IK_CONFIG_DICT[src_human][tgt_robot])
+            print("Use IK config: ", resolved_ik_config_path)
         
         # compute the scale ratio based on given human height and the assumption in the IK config
         if actual_human_height is not None:
