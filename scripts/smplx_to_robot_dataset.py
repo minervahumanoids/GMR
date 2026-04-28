@@ -62,6 +62,9 @@ def process_file(
     fk_device,
     robot_xml_path,
     ik_config_path,
+    target_fps,
+    height_adjust_mode,
+    root_origin_mode,
     total_files,
     verbose=False,
 ):
@@ -95,10 +98,13 @@ def process_file(
         print(f"Error loading {smplx_file_path}: {e}")
         return
     
-  
-    tgt_fps = 30
     try:
-        smplx_frame_data_list, aligned_fps = get_smplx_data_offline_fast(smplx_data, body_model, smplx_output, tgt_fps=tgt_fps)
+        smplx_frame_data_list, aligned_fps = get_smplx_data_offline_fast(
+            smplx_data,
+            body_model,
+            smplx_output,
+            tgt_fps=target_fps,
+        )
     except Exception as e:
         print(f"Error processing {smplx_file_path}: {e}")
         return
@@ -145,20 +151,22 @@ def process_file(
 
     body_names = kinematics_model.body_names
     
-    HEIGHT_ADJUST = True
-    if HEIGHT_ADJUST:
-        # height adjust to ensure the lowerset part is on the ground
+    if height_adjust_mode == "min_body_to_ground":
+        # Optional explicit recipe step: move the lowest body point to z=0.
         body_pos, _ = kinematics_model.forward_kinematics(torch.from_numpy(root_pos).to(device=device, dtype=torch.float), 
                                                         torch.from_numpy(root_rot).to(device=device, dtype=torch.float), 
                                                         torch.from_numpy(dof_pos).to(device=device, dtype=torch.float)) # TxNx3
         ground_offset = 0.0
         lowerst_height = torch.min(body_pos[..., 2]).item()
         root_pos[:, 2] = root_pos[:, 2] - lowerst_height + ground_offset # make sure motion on the ground
+    elif height_adjust_mode != "none":
+        raise ValueError(f"Unsupported height_adjust_mode: {height_adjust_mode}")
         
-    ROOT_ORIGIN_OFFSET = True
-    if ROOT_ORIGIN_OFFSET:
-        # offset using the first frame
+    if root_origin_mode == "zero_xy":
+        # Optional explicit recipe step: normalize XY origin to the first frame.
         root_pos[:, :2] -= root_pos[0, :2]
+    elif root_origin_mode != "none":
+        raise ValueError(f"Unsupported root_origin_mode: {root_origin_mode}")
         
         
     motion_data = {
@@ -168,6 +176,11 @@ def process_file(
         "dof_pos": dof_pos,
         "local_body_pos": local_body_pos.detach().cpu().numpy(),
         "link_body_list": body_names,
+        "retarget_config": {
+            "target_fps": target_fps,
+            "height_adjust_mode": height_adjust_mode,
+            "root_origin_mode": root_origin_mode,
+        },
     }
 
 
@@ -214,7 +227,34 @@ def main():
     parser.add_argument("--device", default="auto", help="Forward-kinematics device: auto, cpu, cuda:0, ...")
     parser.add_argument("--robot-xml-path", default=None, help="Optional robot XML path overriding GMR's robot registry.")
     parser.add_argument("--ik-config-path", default=None, help="Optional IK config JSON path overriding GMR's robot registry.")
+    parser.add_argument("--target-fps", default=30, type=int, help="Output FPS used when sampling SMPL-X frames.")
+    parser.add_argument(
+        "--height-adjust-mode",
+        choices=("none", "min_body_to_ground"),
+        default="none",
+        help="Optional root-z adjustment. Default does no height adjustment.",
+    )
+    parser.add_argument(
+        "--root-origin-mode",
+        choices=("none", "zero_xy"),
+        default="none",
+        help="Optional root XY origin normalization. Default preserves the original root trajectory.",
+    )
+    parser.add_argument(
+        "--filter-hard-motions",
+        action="store_true",
+        help="Opt in to filtering motions listed in assets/hard_motions/*.txt. Disabled by default.",
+    )
+    parser.add_argument(
+        "--exclude-motion-name-contains",
+        action="append",
+        default=[],
+        metavar="TEXT",
+        help="Opt in to skipping motions whose filename stem contains TEXT. May be repeated.",
+    )
     args = parser.parse_args()
+    if args.target_fps <= 0:
+        raise ValueError(f"--target-fps must be positive, got {args.target_fps}")
     
     # print the total number of cpus and gpus
     print(f"Total CPUs: {mp.cpu_count()}")
@@ -226,22 +266,22 @@ def main():
     print(f"Using FK device: {fk_device}")
 
     SMPLX_FOLDER = HERE / ".." / "assets" / "body_models"
-    hard_motions_folder = HERE / ".." / "assets" / "hard_motions"
-
     verbose = False
 
-    hard_motions_paths = [hard_motions_folder / "0.txt", 
-                          hard_motions_folder / "1.txt"]
     hard_motions = []
-    for hard_motions_path in hard_motions_paths:
-        with open(hard_motions_path, "r") as f:
-            for line in f:
-                if "Motion:" in line:
-                    motion_path = line.split(":")[1].strip()
-                else:
-                    continue
-                motion_path = motion_path.split(",")[0].strip().split(".")[0]
-                hard_motions.append(motion_path)
+    if args.filter_hard_motions:
+        hard_motions_folder = HERE / ".." / "assets" / "hard_motions"
+        hard_motions_paths = [hard_motions_folder / "0.txt",
+                              hard_motions_folder / "1.txt"]
+        for hard_motions_path in hard_motions_paths:
+            with open(hard_motions_path, "r") as f:
+                for line in f:
+                    if "Motion:" in line:
+                        motion_path = line.split(":")[1].strip()
+                    else:
+                        continue
+                    motion_path = motion_path.split(",")[0].strip().split(".")[0]
+                    hard_motions.append(motion_path)
                 
                 
     args_list = []
@@ -262,21 +302,23 @@ def main():
                         fk_device,
                         args.robot_xml_path,
                         args.ik_config_path,
+                        args.target_fps,
+                        args.height_adjust_mode,
+                        args.root_origin_mode,
                     ))
     print("full args_list:", len(args_list))
     
-    # remove hard and infeasible motions
-    exclude_file_content = ["BMLrub", "EKUT", "crawl", "_lie", "upstairs", "downstairs"]
-    
-    new_args_list = []
-    for arguments in args_list:
-        motion_name = arguments[0].split("/")[-1].split('.')[0]
-        if motion_name in hard_motions:
-            continue
-        if any(content in motion_name for content in exclude_file_content):
-            continue
-        new_args_list.append(arguments)
-    args_list = new_args_list
+    # Optional caller-controlled filtering only. By default GMR retargets every input file.
+    if hard_motions or args.exclude_motion_name_contains:
+        new_args_list = []
+        for arguments in args_list:
+            motion_name = arguments[0].split("/")[-1].split('.')[0]
+            if motion_name in hard_motions:
+                continue
+            if any(content in motion_name for content in args.exclude_motion_name_contains):
+                continue
+            new_args_list.append(arguments)
+        args_list = new_args_list
     
     
     print("new args_list:", len(args_list))
