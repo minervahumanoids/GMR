@@ -225,6 +225,11 @@ def main():
     parser.add_argument("--override", default=False, action="store_true")
     parser.add_argument("--num_cpus", default=4, type=int)
     parser.add_argument("--device", default="auto", help="Forward-kinematics device: auto, cpu, cuda:0, ...")
+    parser.add_argument(
+        "--smplx-model-dir",
+        default=None,
+        help="SMPL-X body model directory containing the smplx/ subfolder. Defaults to GMR assets/body_models.",
+    )
     parser.add_argument("--robot-xml-path", default=None, help="Optional robot XML path overriding GMR's robot registry.")
     parser.add_argument("--ik-config-path", default=None, help="Optional IK config JSON path overriding GMR's robot registry.")
     parser.add_argument("--target-fps", default=30, type=int, help="Output FPS used when sampling SMPL-X frames.")
@@ -265,7 +270,9 @@ def main():
     fk_device = resolve_torch_device(args.device)
     print(f"Using FK device: {fk_device}")
 
-    SMPLX_FOLDER = HERE / ".." / "assets" / "body_models"
+    SMPLX_FOLDER = pathlib.Path(args.smplx_model_dir).expanduser().resolve() if args.smplx_model_dir else HERE / ".." / "assets" / "body_models"
+    if not (SMPLX_FOLDER / "smplx").is_dir():
+        raise FileNotFoundError(f"SMPL-X body model directory not found: {SMPLX_FOLDER / 'smplx'}")
     verbose = False
 
     hard_motions = []
