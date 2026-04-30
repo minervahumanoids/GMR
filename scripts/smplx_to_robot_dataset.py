@@ -68,6 +68,14 @@ def process_file(
     total_files,
     verbose=False,
 ):
+    """Retarget one SMPL-X motion file and report whether output was created.
+
+    This worker intentionally returns ``True`` only after the target pickle has
+    been written. Earlier versions swallowed per-file failures and returned
+    ``None``, which let the batch script exit successfully even when callers
+    such as MDP were missing expected outputs. Returning a boolean gives
+    ``main()`` enough information to fail the process when any item fails.
+    """
     def log_memory(message):
         if verbose:
             process = psutil.Process(os.getpid())
@@ -336,11 +344,11 @@ def main():
     with mp.Pool(args.num_cpus) as pool:
         results = pool.starmap(process_file, [args + (total_files, verbose) for args in args_list])
 
-    # MDP and other callers depend on the process exit status to distinguish
-    # "all files retargeted" from "the batch script ran but skipped failures".
-    # Without this, one bad SMPL-X file can produce no .pkl while GMR exits 0.
     failed = sum(1 for result in results if not result)
     if failed:
+        # MDP and other callers depend on the process exit status to distinguish
+        # "all files retargeted" from "the batch script ran but skipped failures".
+        # Without this, one bad SMPL-X file can produce no .pkl while GMR exits 0.
         raise SystemExit(f"GMR failed to process {failed}/{total_files} files.")
 
     print("Done. Saved to ", tgt_folder)

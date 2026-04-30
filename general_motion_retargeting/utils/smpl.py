@@ -8,6 +8,16 @@ from scipy.interpolate import interp1d
 import general_motion_retargeting.utils.lafan_vendor.utils as utils
 
 def _expand_betas_for_frames(betas, num_frames, num_betas):
+    """Return SMPL-X betas with the same batch dimension as per-frame poses.
+
+    AMASS/MDP inputs usually store body shape once per clip as ``(B,)`` or
+    ``(1, B)`` while ``root_orient``, ``pose_body``, and ``trans`` are stored
+    per frame. Newer torch/smplx versions require every tensor passed to the
+    SMPL-X layer to share the same leading dimension, so a clip-level shape
+    vector must be repeated to ``(num_frames, num_betas)`` before the forward
+    pass. The padding/truncation keeps older 10-beta inputs and 16-beta SMPL-X
+    inputs compatible with the model instance being used.
+    """
     betas = torch.tensor(betas).float()
     if betas.ndim == 1:
         current_dim = betas.shape[0]
@@ -34,6 +44,12 @@ def _expand_betas_for_frames(betas, num_frames, num_betas):
     return betas
 
 def _num_betas_from_array(betas):
+    """Infer the beta dimension for constructing a matching SMPL-X model.
+
+    The SMPL-X layer allocates batch-shaped buffers when it is constructed.
+    Passing ``batch_size=num_frames`` and the real beta count prevents internal
+    size mismatches when per-frame poses are evaluated in one batch.
+    """
     betas = np.asarray(betas)
     if betas.ndim == 0:
         return 1
