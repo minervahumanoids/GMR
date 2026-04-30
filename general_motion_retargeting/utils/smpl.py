@@ -7,26 +7,61 @@ from scipy.interpolate import interp1d
 
 import general_motion_retargeting.utils.lafan_vendor.utils as utils
 
+def _expand_betas_for_frames(betas, num_frames, num_betas):
+    betas = torch.tensor(betas).float()
+    if betas.ndim == 1:
+        current_dim = betas.shape[0]
+    elif betas.ndim == 2:
+        current_dim = betas.shape[1]
+    else:
+        raise ValueError(f"Unexpected betas rank: {betas.ndim}")
+
+    if current_dim > num_betas:
+        betas = betas[..., :num_betas]
+    elif current_dim < num_betas:
+        pad = torch.zeros((*betas.shape[:-1], num_betas - current_dim), dtype=betas.dtype)
+        betas = torch.cat((betas, pad), dim=-1)
+
+    # SMPL-X used to tolerate a single shape vector with per-frame poses in some
+    # environments. Newer torch/smplx versions require all batched inputs to have
+    # the same leading dimension, so repeat the clip-level body shape per frame.
+    if betas.ndim == 1:
+        return betas.view(1, -1).expand(num_frames, -1)
+    if betas.shape[0] == 1:
+        return betas.expand(num_frames, -1)
+    if betas.shape[0] != num_frames:
+        raise ValueError(f"Unexpected betas shape {tuple(betas.shape)} for num_frames={num_frames}")
+    return betas
+
+def _num_betas_from_array(betas):
+    betas = np.asarray(betas)
+    if betas.ndim == 0:
+        return 1
+    return betas.shape[-1]
+
 def load_smpl_file(smpl_file):
     smpl_data = np.load(smpl_file, allow_pickle=True)
     return smpl_data
 
 def load_smplx_file(smplx_file, smplx_body_model_path):
     smplx_data = np.load(smplx_file, allow_pickle=True)
+    num_frames = smplx_data["pose_body"].shape[0]
+    num_betas = _num_betas_from_array(smplx_data["betas"])
     body_model = smplx.create(
         smplx_body_model_path,
         "smplx",
         gender=str(smplx_data["gender"]),
         use_pca=False,
+        num_betas=num_betas,
+        batch_size=num_frames,
     )
     # print(smplx_data["pose_body"].shape)
     # print(smplx_data["betas"].shape)
     # print(smplx_data["root_orient"].shape)
     # print(smplx_data["trans"].shape)
     
-    num_frames = smplx_data["pose_body"].shape[0]
     smplx_output = body_model(
-        betas=torch.tensor(smplx_data["betas"]).float().view(1, -1), # (16,)
+        betas=_expand_betas_for_frames(smplx_data["betas"], num_frames, body_model.num_betas),
         global_orient=torch.tensor(smplx_data["root_orient"]).float(), # (N, 3)
         body_pose=torch.tensor(smplx_data["pose_body"]).float(), # (N, 63)
         transl=torch.tensor(smplx_data["trans"]).float(), # (N, 3)
@@ -72,16 +107,18 @@ def load_gvhmr_pred_file(gvhmr_pred_file, smplx_body_model_path):
         "mocap_frame_rate": torch.tensor(30),
     }
 
+    num_frames = smpl_params_global['body_pose'].shape[0]
     body_model = smplx.create(
         smplx_body_model_path,
         "smplx",
         gender="neutral",
         use_pca=False,
+        num_betas=_num_betas_from_array(betas),
+        batch_size=num_frames,
     )
     
-    num_frames = smpl_params_global['body_pose'].shape[0]
     smplx_output = body_model(
-        betas=torch.tensor(smplx_data["betas"]).float().view(1, -1), # (16,)
+        betas=_expand_betas_for_frames(smplx_data["betas"], num_frames, body_model.num_betas),
         global_orient=torch.tensor(smplx_data["root_orient"]).float(), # (N, 3)
         body_pose=torch.tensor(smplx_data["pose_body"]).float(), # (N, 63)
         transl=torch.tensor(smplx_data["trans"]).float(), # (N, 3)

@@ -88,7 +88,7 @@ def process_file(
         num_pause += 1
         if num_pause > 10:
             print(f"[ERROR] Memory usage is still high after 10 pauses. Exiting.")
-            return
+            return False
 
     try:
         smplx_data, body_model, smplx_output, actual_human_height = load_smplx_file(smplx_file_path, SMPLX_FOLDER)
@@ -96,7 +96,7 @@ def process_file(
         log_memory("After loading SMPL-X data")
     except Exception as e:
         print(f"Error loading {smplx_file_path}: {e}")
-        return
+        return False
     
     try:
         smplx_frame_data_list, aligned_fps = get_smplx_data_offline_fast(
@@ -107,7 +107,7 @@ def process_file(
         )
     except Exception as e:
         print(f"Error processing {smplx_file_path}: {e}")
-        return
+        return False
     
     # retarget
     retargeter = GMR(
@@ -133,7 +133,7 @@ def process_file(
         root_pos = qpos_list[:, :3]
     except Exception as e:
         print(f"Error processing {smplx_file_path}: {e}")
-        return
+        return False
     root_rot = qpos_list[:, 3:7]
     root_rot[:, [0, 1, 2, 3]] = root_rot[:, [1, 2, 3, 0]]
     dof_pos = qpos_list[:, 7:]
@@ -209,6 +209,7 @@ def process_file(
     if str(device).startswith("cuda") and torch.cuda.is_available():
         torch.cuda.empty_cache()
     gc.collect()
+    return True
     
 
 
@@ -333,7 +334,14 @@ def main():
     total_files = len(args_list)
     print(f"Total number of files to process: {total_files}")
     with mp.Pool(args.num_cpus) as pool:
-        pool.starmap(process_file, [args + (total_files, verbose) for args in args_list])
+        results = pool.starmap(process_file, [args + (total_files, verbose) for args in args_list])
+
+    # MDP and other callers depend on the process exit status to distinguish
+    # "all files retargeted" from "the batch script ran but skipped failures".
+    # Without this, one bad SMPL-X file can produce no .pkl while GMR exits 0.
+    failed = sum(1 for result in results if not result)
+    if failed:
+        raise SystemExit(f"GMR failed to process {failed}/{total_files} files.")
 
     print("Done. Saved to ", tgt_folder)
 
